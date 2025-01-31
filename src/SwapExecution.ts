@@ -1,9 +1,9 @@
 import {
   Contract,
-  Signer,
   Interface,
-  ZeroAddress,
-  Transaction
+  Signer,
+  Transaction,
+  ZeroAddress
 } from 'ethers';
 import JSBI from 'jsbi';
 import { GetQuoteResult } from "./types.ts";
@@ -165,6 +165,73 @@ export class SwapRouter {
     return maximumAmount;
   }
 
+  private async approveTokenIfNeeded(
+    token: Token,
+    amount: JSBI,
+    account: Signer
+  ): Promise<void> {
+    if (token.address === ZeroAddress) {
+      return; // No approval needed for ETH
+    }
+
+    const erc20Interface = new Interface([
+      'function approve(address spender, uint256 amount) external returns (bool)',
+      'function allowance(address owner, address spender) external view returns (uint256)'
+    ]);
+
+    const tokenContract = new Contract(
+      token.address,
+      erc20Interface,
+      account
+    );
+
+    const signerAddress = await account.getAddress();
+    const currentAllowance = await tokenContract.allowance(signerAddress, this.routerAddress);
+
+    if (JSBI.GT(amount, JSBI.BigInt(currentAllowance.toString()))) {
+      console.log('Approving token...');
+      const tx = await tokenContract.approve(
+        this.routerAddress,
+        amount.toString()
+      );
+      await tx.wait();
+      console.log('Token approved');
+    } else {
+      console.log('Token already approved');
+    }
+  }
+
+  private encodePath(route: Route): string {
+    const encoded = route.pools.map((pool, i) => {
+      const tokenIn = route.path[i];
+      const tokenOut = route.path[i + 1];
+      const fee = pool.fee.toString(16).padStart(6, '0');
+
+      if (i === route.pools.length - 1) {
+        return `${tokenIn.address.toLowerCase().slice(2)}${fee}${tokenOut.address.toLowerCase().slice(2)}`;
+      }
+      return `${tokenIn.address.toLowerCase().slice(2)}${fee}`;
+    }).join('');
+
+    return '0x' + encoded;
+  }
+
+  private encodePathReversed(route: Route): string {
+    const encoded = [...route.pools].reverse().map((pool, i, reversedPools) => {
+      const pathLength = route.path.length;
+      const tokenIn = route.path[pathLength - 1 - i];
+      const tokenOut = route.path[pathLength - 2 - i];
+      const fee = pool.fee.toString(16).padStart(6, '0');
+
+      if (i === reversedPools.length - 1) {
+        return `${tokenIn.address.toLowerCase().slice(2)}${fee}${tokenOut.address.toLowerCase().slice(2)}`;
+      }
+      return `${tokenIn.address.toLowerCase().slice(2)}${fee}`;
+    }).join('');
+
+    return '0x' + encoded;
+  }
+
   async executeSwap(
     trade: Trade,
     options: SwapOptions,
@@ -181,52 +248,115 @@ export class SwapRouter {
       : '0';
 
     try {
+      // Check and approve token if needed
       if (trade.type === TradeType.EXACT_INPUT) {
-        const params = {
-          tokenIn: trade.route.path[0].address,
-          tokenOut: trade.route.path[1].address,
-          fee: trade.route.pools[0].fee,
-          recipient: options.recipient,
-          amountIn: trade.inputAmount.raw.toString(),
-          amountOutMinimum: this.calculateMinimumOut(trade.outputAmount, options.slippageTolerance).toString(),
-          sqrtPriceLimitX96: 0
-        };
-
-        console.log('Debug exactInput parameters:', {
-          ...params,
-          value,
-          slippageTolerance: options.slippageTolerance,
-        });
-
-        await contract.exactInputSingle.staticCall(params, { value });
-        const gasLimit = await contract.exactInputSingle.estimateGas(params, { value });
-        return contract.exactInputSingle(params, {
-          gasLimit: gasLimit * 120n / 100n,
-          value
-        });
+        await this.approveTokenIfNeeded(
+          trade.inputAmount.token,
+          trade.inputAmount.raw,
+          account
+        );
       } else {
-        const params = {
-          tokenIn: trade.route.path[0].address,
-          tokenOut: trade.route.path[1].address,
-          fee: trade.route.pools[0].fee,
-          recipient: options.recipient,
-          amountOut: trade.outputAmount.raw.toString(),
-          amountInMaximum: this.calculateMaximumIn(trade.inputAmount, options.slippageTolerance).toString(),
-          sqrtPriceLimitX96: 0
-        };
+        // For exactOutput, approve the maximum possible input amount
+        await this.approveTokenIfNeeded(
+          trade.inputAmount.token,
+          this.calculateMaximumIn(trade.inputAmount, options.slippageTolerance),
+          account
+        );
+      }
 
-        console.log('Debug exactOutput parameters:', {
-          ...params,
-          value,
-          slippageTolerance: options.slippageTolerance,
-        });
+      // Determine if this is a single-hop or multi-hop trade
+      const isMultiHop = trade.route.pools.length > 1;
 
-        await contract.exactOutputSingle.staticCall(params, { value });
-        const gasLimit = await contract.exactOutputSingle.estimateGas(params, { value });
-        return contract.exactOutputSingle(params, {
-          gasLimit: gasLimit * 120n / 100n,
-          value
-        });
+      if (trade.type === TradeType.EXACT_INPUT) {
+        if (isMultiHop) {
+          const params = {
+            path: this.encodePath(trade.route),
+            recipient: options.recipient,
+            amountIn: trade.inputAmount.raw.toString(),
+            amountOutMinimum: this.calculateMinimumOut(trade.outputAmount, options.slippageTolerance).toString()
+          };
+
+          console.log('Debug exactInput (multi-hop) parameters:', {
+            ...params,
+            value,
+            slippageTolerance: options.slippageTolerance,
+          });
+
+          await contract.exactInput.staticCall(params, { value });
+          const gasLimit = await contract.exactInput.estimateGas(params, { value });
+          return contract.exactInput(params, {
+            gasLimit: gasLimit * 120n / 100n,
+            value
+          });
+        } else {
+          const params = {
+            tokenIn: trade.route.path[0].address,
+            tokenOut: trade.route.path[1].address,
+            fee: trade.route.pools[0].fee,
+            recipient: options.recipient,
+            amountIn: trade.inputAmount.raw.toString(),
+            amountOutMinimum: this.calculateMinimumOut(trade.outputAmount, options.slippageTolerance).toString(),
+            sqrtPriceLimitX96: 0
+          };
+
+          console.log('Debug exactInputSingle parameters:', {
+            ...params,
+            value,
+            slippageTolerance: options.slippageTolerance,
+          });
+
+          await contract.exactInputSingle.staticCall(params, { value });
+          const gasLimit = await contract.exactInputSingle.estimateGas(params, { value });
+          return contract.exactInputSingle(params, {
+            gasLimit: gasLimit * 120n / 100n,
+            value
+          });
+        }
+      } else {
+        if (isMultiHop) {
+          const params = {
+            path: this.encodePathReversed(trade.route),
+            recipient: options.recipient,
+            amountOut: trade.outputAmount.raw.toString(),
+            amountInMaximum: this.calculateMaximumIn(trade.inputAmount, options.slippageTolerance).toString()
+          };
+
+          console.log('Debug exactOutput (multi-hop) parameters:', {
+            ...params,
+            value,
+            slippageTolerance: options.slippageTolerance,
+          });
+
+          await contract.exactOutput.staticCall(params, { value });
+          const gasLimit = await contract.exactOutput.estimateGas(params, { value });
+          return contract.exactOutput(params, {
+            gasLimit: gasLimit * 120n / 100n,
+            value
+          });
+        } else {
+          const params = {
+            tokenIn: trade.route.path[0].address,
+            tokenOut: trade.route.path[1].address,
+            fee: trade.route.pools[0].fee,
+            recipient: options.recipient,
+            amountOut: trade.outputAmount.raw.toString(),
+            amountInMaximum: this.calculateMaximumIn(trade.inputAmount, options.slippageTolerance).toString(),
+            sqrtPriceLimitX96: 0
+          };
+
+          console.log('Debug exactOutputSingle parameters:', {
+            ...params,
+            value,
+            slippageTolerance: options.slippageTolerance,
+          });
+
+          await contract.exactOutputSingle.staticCall(params, { value });
+          const gasLimit = await contract.exactOutputSingle.estimateGas(params, { value });
+          return contract.exactOutputSingle(params, {
+            gasLimit: gasLimit * 120n / 100n,
+            value
+          });
+        }
       }
     } catch (error) {
       console.error('Swap failed:', error);

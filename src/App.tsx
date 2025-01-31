@@ -9,8 +9,8 @@ import { useCallback, useMemo } from "react";
 const RPC_URL = "https://rpc.flame.astria.org";
 const SWAP_ROUTER_ADDRESS = "0x29bBaFf21695fA41e446c4f37c07C699d9f08021";
 const RECIPIENT_ADDRESS = "0xb0E31D878F49Ec0403A25944d6B1aE1bf05D17E1";
-const AMOUNT = "10000000000000000";
-const TRADE_TYPE = "exactOut";
+const AMOUNT = "100000";
+const TRADE_TYPE = "exactIn";
 
 function App() {
 
